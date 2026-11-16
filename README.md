@@ -8,7 +8,7 @@
 - 技术栈：Python 3.12 / FastAPI / PostgreSQL 18 / psycopg 3（无 ORM，显式 SQL）
 - 项目类型：**后端服务**，因此提供 OpenAPI 3.x 与 Swagger UI：
   - Swagger UI: `http://127.0.0.1:8000/docs`
-  - OpenAPI JSON: `http://127.0.0.1:8000/openapi.json`（OpenAPI 3.1.0，27 条路径）
+  - OpenAPI JSON: `http://127.0.0.1:8000/openapi.json`（OpenAPI 3.1.0，34 条路径）
 
 ---
 
@@ -73,7 +73,7 @@ export AUDIENCE_ANALYST_API_KEY=dev-analyst-key
 
 ### 运行阶段
 
-`validate_inputs → build_sample → program_exposure → calibrate → bootstrap → estimate → publish_report`
+`validate_inputs → build_sample → program_exposure → calibrate → bootstrap → estimate → segment_retention → publish_report`
 
 `POST /v1/runs/{id}/execute` 带 `max_steps`，每次推进若干阶段；中断后再次调用同一接口会从上次位置继续，输入与种子不变。
 
@@ -161,6 +161,48 @@ export AUDIENCE_ANALYST_API_KEY=dev-analyst-key
 
 理由：每档节目的估计建立在不同的、覆盖不完整的子总体上，跨节目差值会把覆盖差异误读成节目表现差异。
 
+### 4.9 段级留存（粗粒度收听记录）
+
+五分钟粒度的收听记录跨过广告/段落边界时，无法知道听众究竟停在哪一段；实际延播又会让计划节目表失效。
+本服务把这两件事分开处理，并**从不把模型输出冒充实测**。
+
+**确认播出版本（effective version）**
+
+- 一个 airing 计划时段来自节目批次；若分析员登记了 `broadcast_confirmations` 并把它 pin 进运行
+  （`inputs.confirmation_seqs`），则以**确认的实际播出起止**为准，边界偏移从确认起点重新计算。
+- 未登记确认时，使用**明确指定的**计划节目表，版本记为 `planned`。
+- 版本变化（延播确认、节目表修订批次）只会产生**新的运行与新的报告**；已发布报告永不被就地改写。
+
+**每条记录的归属（per record, per segment）**
+
+| 归属 | 含义 | 作用 |
+| --- | --- | --- |
+| `definite` | 记录按粒度外扩半格后仍完全落在一个段内 | 构成**无模型的确定计数** |
+| `possible` | 记录跨段（或跨节目）边界 | **只扩大区间**，绝不折算成单点比例 |
+| `unassignable` | 记录与未决跨台冲突重叠，或无法归到已确认版本 | 视为未知，绝不当成“没听” |
+
+**留存队列与硬边界**：队列 = 在节目首段出现的人（`definite`/`possible`）。某段的 `lower = 该段 definite 人数 / 队列人数`，
+`upper = (definite + possible) / 队列人数`。只有**没有任何跨界记录**的段才给出无模型的 `point_share`；其余段只有区间。
+缺失日记、未填时段、未决冲突的人在上游就被排除，既不在队列也不进分母，绝不按 0 收听计入。
+
+**区间删失模型（可选，公开敏感参数）**
+
+- 配置 `config.retention.model = interval_censored`（默认）或 `none`。
+- 把报入的起止视为真实起止在 ±半个记录粒度内的**区间删失**观测，声明“端点在内均匀”的放置规则，
+  给出 `share` 与 `sensitivity`（`at_end` 低、`at_start` 高两个极端）区间。
+- 模型值被**夹在**无模型硬区间内（`hard_bound_interval`），并始终标注 `measured: false` 与
+  `assumptions.not_a_measurement = true`——它更平滑，但**不是实测**。
+
+**跨午夜**：每个段按**实际本地午夜**切分（`split_by_actual_day` 逐光标解析当地日），再给 `by_day_minutes`，
+不会假设固定 24 小时。
+
+**发布器拒绝非单调留存**：同一 airing 内，保守（`lower`）留存不得从一段升到下一段。若各段各自删掉不确定用户导致
+`lower` 反升，该检查标 `violated`，运行被置为 `rejected`（`failure.code = retention_non_monotone`），**不发布报告**。
+`config.retention.require_monotone = false` 时只记录 `reported_not_enforced`，不阻断（默认强制）。
+
+**重演**：`GET /v1/runs/{id}/segment-retention/replay` 用 pinned 输入重算并比对 `retention_hash`，
+`reproduced: true` 证明历史曲线可由同一输入、版本与种子重演。
+
 ---
 
 ## 5. 验证方式（以下均为实际执行过的验证）
@@ -172,7 +214,8 @@ export AUDIENCE_TEST_DATABASE_URL=postgresql://ccdev:ccdev@127.0.0.1:5432/ccdev
 .venv/bin/python -m pytest tests/ -q
 ```
 
-实测结果：**53 passed**（`tests/test_core.py` 18 项纯算法测试；`tests/test_api.py` 35 项接口集成测试，
+实测结果：**81 passed**（`tests/test_core.py` 18、`tests/test_api.py` 35 项；
+新增 `tests/test_retention.py` 13 项段级留存纯算法测试、`tests/test_retention_api.py` 15 项接口集成测试；
 使用独立随机 schema，结束后自动清理）。
 
 覆盖的断言包括：
@@ -188,6 +231,10 @@ export AUDIENCE_TEST_DATABASE_URL=postgresql://ccdev:ccdev@127.0.0.1:5432/ccdev
 - 未知入样概率、跨节目比较、空单元、限幅失败均按预期拒绝或标记；
 - **按日记份数直接平均会高估青年节目**：实测 `youth_drive` 未加权均值 80.00 分钟，校准加权后 46.70 分钟（1.71 倍）；
   偏老节目方向相反（`midnight_news` 5.23 → 7.22），说明偏差并非常数。
+- **段级留存**：跨界记录只扩大区间、不发单点（`point_available=false`、`point_share=null`）；无跨界记录的段给
+  无模型单点；模型 `share` 被夹在 `[lower, upper]` 且 `measured=false`；跨午夜段按实际午夜拆成 30/15 分钟；
+  延播确认生成新版本并改变 `retention_hash`；`lower` 反升的运行被 `rejected`（`retention_non_monotone`）且报告 404；
+  replay 重算的 `retention_hash` 与记录一致（`reproduced=true`）。
 
 ### 5.2 完整演示脚本
 
@@ -213,7 +260,13 @@ export AUDIENCE_TEST_DATABASE_URL=postgresql://ccdev:ccdev@127.0.0.1:5432/ccdev
 12. 限幅不可达目标 → `rejected` + `unreachable_cells` + 残差；
 13. 空样本抽样层 `rural-remote` → `strata_without_eligible_sample` 列出，无任何合成样本；
 14. 未知入样概率 → `422` 且列出具体人；
-15. 迟到日记 → 新运行发布，旧报告哈希完全不变。
+15. 迟到日记 → 新运行发布，旧报告哈希完全不变；
+16. **段级留存**（独立数据集 `demo/retention_fixtures.py`）：`seg_show` 的硬边界 `0.923/1.0 → 0.538/0.615 → 0.308/0.308 → 0/0`，
+    首两段有跨界记录故 `point_share=null`、后两段给出无模型单点；模型 `share` 夹在硬边界内且 `measured=false`；
+17. 跨午夜段 `seg_late` 拆成 `2026-09-01: 30` + `2026-09-02: 15` 分钟；
+18. 延播确认 → `version=confirmed:<seq>`、`version_basis=as_aired_log`，`retention_hash` 变、旧报告哈希不变；
+19. `lower` 反升的 `seg_rise` → `rejected` + `retention_non_monotone`，报告 404；
+20. replay 重算 `retention_hash` 与记录一致（`reproduced=true`）。
 
 ### 5.3 手工最小验证
 
@@ -234,7 +287,27 @@ curl -s -H "$KEY" localhost:8000/v1/runs/$RID/report
 ```
 
 已实际执行上式（本地端口 8000 换成当时端口）：运行状态 `published`，报告含三档节目，
-`/docs` 返回 200，`/openapi.json` 为 OpenAPI `3.1.0`，共 27 条路径。
+`/docs` 返回 200，`/openapi.json` 为 OpenAPI `3.1.0`，共 34 条路径。
+
+段级留存的最小验证（`scripts/seed.py --reset` 已写入留存数据集）：
+
+```bash
+KEY='X-API-Key: dev-admin-key'
+SEG=$(curl -s -H "$KEY" localhost:8000/v1/segments/batches | python3 -c \
+  "import sys,json;print([b for b in json.load(sys.stdin) if b['batch_ref']=='segments-v1'][0]['batch_seq'])")
+# 用留存数据集的 frame/target/program（batch_ref 见 /v1/*/batches）
+RID=$(curl -s -H "$KEY" -H 'Content-Type: application/json' -X POST localhost:8000/v1/runs -d '{
+  "note":"manual-retention",
+  "inputs":{"recruitment_batch_seq":3,"target_batch_seq":2,"program_batch_seq":2,
+            "diary_seq_cutoff":'"$(curl -s -H "$KEY" localhost:8000/v1/diary/cutoff | python3 -c "import sys,json;print(json.load(sys.stdin)['available_max_submission_seq'])")"',
+            "segment_batch_seq":'"$SEG"',"confirmation_seqs":[]}}' \
+  | python3 -c "import sys,json;print(json.load(sys.stdin)['run']['run_id'])")
+curl -s -H "$KEY" -H 'Content-Type: application/json' -X POST localhost:8000/v1/runs/$RID/execute -d '{"max_steps":20}'
+curl -s -H "$KEY" localhost:8000/v1/runs/$RID/segment-retention
+curl -s -H "$KEY" localhost:8000/v1/runs/$RID/segment-retention/replay
+```
+
+实测：该运行 `published`，`seg_show` 硬边界与模型如上；replay 返回 `reproduced: true`。
 
 ### 5.4 关于 Docker 的说明
 
@@ -247,7 +320,7 @@ curl -s -H "$KEY" localhost:8000/v1/runs/$RID/report
 
 ## 6. 接口一览
 
-OpenAPI 3.1.0 共 **27 条路径**（同路径的 GET / POST 在表内合并为一行）。完整可交互文档见 `/docs`。
+OpenAPI 3.1.0 共 **34 条路径**（同路径的 GET / POST 在表内合并为一行）。完整可交互文档见 `/docs`。
 
 | 方法 | 路径 | 作用 |
 | --- | --- | --- |
@@ -258,6 +331,8 @@ OpenAPI 3.1.0 共 **27 条路径**（同路径的 GET / POST 在表内合并为�
 | POST/GET | `/v1/programs/batches`、`/v1/programs/batches/{seq}` | 节目单 |
 | POST/GET | `/v1/diary/submissions`、`/v1/diary/submissions/{seq}` | 日记提交与历史 |
 | GET | `/v1/diary/cutoff` | 当前可用最大提交序号 |
+| POST/GET | `/v1/segments/batches`、`/v1/segments/batches/{seq}` | 段边界批次（`unit_minutes` + 各 airing 的偏移段） |
+| POST/GET | `/v1/broadcast/confirmations` | 确认的实际播出起止（延播版本，只追加） |
 | POST/GET | `/v1/runs`、`/v1/runs/{id}` | 创建 / 查看运行（锁定输入） |
 | POST | `/v1/runs/{id}/execute` | 分步执行或续跑 |
 | GET | `/v1/runs/{id}/status` | 阶段、校准、bootstrap、区间状态 |
@@ -274,6 +349,10 @@ OpenAPI 3.1.0 共 **27 条路径**（同路径的 GET / POST 在表内合并为�
 | POST | `/v1/conflicts/resolutions` | 分析员确认冲突（只影响**新运行**） |
 | GET | `/v1/runs/{id}/coverage-gaps` | 覆盖不足群体 |
 | GET | `/v1/runs/{id}/days`、`/v1/runs/{id}/persons` | 每日分类明细、人员权重与排除 |
+| GET | `/v1/runs/{id}/segment-retention` | 段级留存：硬边界、模型估计与依据、版本 |
+| GET | `/v1/runs/{id}/segment-retention/records` | 每条记录的分类（definite/possible/unassignable）与原因 |
+| GET | `/v1/runs/{id}/segment-retention/checks` | 单调性检查与违例 |
+| GET | `/v1/runs/{id}/segment-retention/replay` | 用 pinned 输入重算并比对 `retention_hash` |
 
 ### 从一个节目数字追溯回去
 
@@ -310,14 +389,16 @@ app/
   lineage.py         单个数字的血缘追溯
   differences.py     组内差值区间；跨节目比较的明确拒绝
   analytics/
+    retention.py     段级留存：硬边界、区间删失模型、跨午夜拆分、单调性守卫
     diary.py         日记重建与四分类日核算
     raking.py        有界 raking 与失败状态
     estimate.py      估计量、家庭分层 bootstrap、百分位区间
 demo/
   fixtures.py        虚构家庭 / 个人 / 节目 / 目标 / 日记（含全部边界场景）
+  retention_fixtures.py  段级留存专用虚构数据（延播、跨日、粗粒度、漏访、冲突、节目表修订）
   run_demo.py        端到端演示脚本
 scripts/seed.py      幂等种子写入
-tests/               53 项单元 + 集成测试
+tests/              81 项单元 + 集成测试（含段级留存 28 项）
 docker/              entrypoint
 Dockerfile, docker-compose.yml, requirements.txt, pytest.ini
 ```
@@ -331,3 +412,6 @@ Dockerfile, docker-compose.yml, requirements.txt, pytest.ini
 - 日记日固定为当地日历日（`00:00→24:00`）；若改用广播日，需要新的 `diary_window` 约定并重跑。
 - 分析员确认冲突时点会影响后续运行结果，但**不会**改写已发布报告。
 - Docker 配置未在本次环境实际运行（该环境没有 Docker），见 5.4。
+- 段级留存的粗粒度归属只对**已确认或明确指定**的版本计算；无确认用计划表。模型估计为区间删失插值，
+  公开敏感参数并始终 `measured=false`，不能当作实测比例。
+- 留存硬边界以无加权人数份额发布；加权份额字段一并保留但不用于单调性判定。

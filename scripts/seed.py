@@ -82,10 +82,48 @@ def ingest_diaries(db: Database, tz, include_resubmission: bool = True) -> dict:
     }
 
 
+def seed_retention(db: Database, tz) -> dict:
+    """Seed the separate segment-retention dataset (own frame/schedule/diaries).
+
+    Kept apart from the main dataset so the 0-1 numbers are unchanged. Returns
+    the pinned sequences a retention run needs.
+    """
+    from demo import retention_fixtures as rf
+
+    frame = ingest.create_recruitment_batch(db, rf.retention_recruitment_batch(), "seed")
+    tgt = ingest.create_target_batch(db, rf.retention_target_batch(), "seed")
+    prg = ingest.create_program_batch(db, rf.retention_program_batch(), "seed")
+    seg = ingest.create_segment_batch(db, rf.retention_segment_batch(), "seed")
+    rise_prg = ingest.create_program_batch(db, rf.retention_program_batch_rise(), "seed")
+    rise_seg = ingest.create_segment_batch(db, rf.rising_segment_batch(), "seed")
+    for sub in rf.retention_diaries():
+        ingest.create_diary_submission(db, sub, "seed", tz)
+    with db.scoped() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT COALESCE(MAX(submission_seq),0) AS m FROM diary_submissions")
+        cutoff = cur.fetchone()["m"]
+    return {
+        "recruitment_batch_seq": frame["batch_seq"],
+        "target_batch_seq": tgt["batch_seq"],
+        "program_batch_seq": prg["batch_seq"],
+        "segment_batch_seq": seg["batch_seq"],
+        "rise_program_batch_seq": rise_prg["batch_seq"],
+        "rise_segment_batch_seq": rise_seg["batch_seq"],
+        "diary_cutoff": cutoff,
+    }
+
+
 def db_has_data(db: Database) -> bool:
     with db.scoped() as conn:
         cur = conn.cursor()
         cur.execute("SELECT COUNT(*) AS c FROM recruitment_batches")
+        return cur.fetchone()["c"] > 0
+
+
+def retention_already_seeded(db: Database) -> bool:
+    with db.scoped() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) AS c FROM segment_batches")
         return cur.fetchone()["c"] > 0
 
 
@@ -98,7 +136,15 @@ def main() -> None:
     if db_has_data(db):
         # Seeding is insert-only; a second call must not duplicate the frame or
         # collide with existing diary revisions. Use --reset to start over.
-        print("database already seeded; pass --reset to rebuild the schema")
+        # The retention dataset lives alongside the main one and can still be
+        # added to a database that predates it.
+        if not retention_already_seeded(db):
+            from zoneinfo import ZoneInfo
+
+            retention = seed_retention(db, ZoneInfo(settings.service_timezone))
+            print({"retention": retention, "note": "added retention dataset"})
+        else:
+            print("database already seeded; pass --reset to rebuild the schema")
         db.close()
         return
     seeded = seed(db)
@@ -106,7 +152,8 @@ def main() -> None:
 
     tz = ZoneInfo(settings.service_timezone)
     diaries = ingest_diaries(db, tz)
-    print({"seeded": seeded, "diaries": diaries})
+    retention = seed_retention(db, tz)
+    print({"seeded": seeded, "diaries": diaries, "retention": retention})
     db.close()
 
 

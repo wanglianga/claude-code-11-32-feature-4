@@ -28,6 +28,7 @@ def build_report(cur, run_id) -> dict[str, Any]:
     config = loads(run["config"])
     calibration = loads(run["calibration"]) if run["calibration"] else None
     bootstrap = loads(run["bootstrap"]) if run["bootstrap"] else None
+    retention_summary = loads(run["retention"]) if run["retention"] else None
     inputs = {}
     cur.execute("SELECT kind, payload FROM run_inputs WHERE run_id=%s", (str(run_id),))
     for row in cur.fetchall():
@@ -117,6 +118,7 @@ def build_report(cur, run_id) -> dict[str, Any]:
     ]
 
     weights = [float(p["final_weight"]) for p in eligible if p["final_weight"] is not None]
+    retention_section = _retention_section(cur, run_id, retention_summary)
     report = {
         "run_id": str(run_id),
         "status": "published",
@@ -164,11 +166,14 @@ def build_report(cur, run_id) -> dict[str, Any]:
             "persons_without_diary_excluded_not_zero": True,
         },
         "comparison": PROGRAM_COMPARISON_BLOCK,
+        "segment_retention": retention_section,
         "limitations": [
             "Fictional data only: no real population register or listening device is used.",
             "Reach and mean minutes are model estimates; only the recorded diary coverage is represented.",
             "Unknown inclusion probability blocks a formal population estimate.",
             "Uncalibrated or non-converged weights are never published.",
+            "Segment retention at a coarse recording granularity is hard-bounded; any point value is a "
+            "declared interval-censored model estimate (measured=false), never a measurement.",
         ],
     }
     return report
@@ -180,3 +185,98 @@ def kish(weights: list[float]) -> float | None:
     s = sum(weights)
     sq = sum(w * w for w in weights)
     return round((s * s) / sq, 3) if sq else None
+
+
+def _retention_section(cur, run_id, summary: dict[str, Any] | None) -> dict[str, Any]:
+    """Assemble the published segment-retention section.
+
+    The section always states the method and its limitation. Hard bounds and
+    the model estimate are kept in separate keys so a reader can never mistake
+    the model number for a measured share.
+    """
+    if not summary or not summary.get("enabled"):
+        return {
+            "available": False,
+            "reason": "no segment batch was pinned for this run",
+        }
+
+    cur.execute(
+        """
+        SELECT payload FROM run_segment_retention WHERE run_id=%s
+         ORDER BY program_key, air_date, station, segment_index
+        """,
+        (str(run_id),),
+    )
+    segments = [loads(r["payload"]) for r in cur.fetchall()]
+    cur.execute(
+        """
+        SELECT classification, COUNT(*) AS c FROM run_segment_records
+         WHERE run_id=%s GROUP BY classification ORDER BY classification
+        """,
+        (str(run_id),),
+    )
+    label_totals = {r["classification"]: int(r["c"]) for r in cur.fetchall()}
+
+    programs: dict[str, dict[str, Any]] = {}
+    for seg in segments:
+        prog = programs.setdefault(
+            seg["program_key"],
+            {
+                "program_key": seg["program_key"],
+                "title": seg["title"],
+                "station": seg["station"],
+                "air_date": seg["air_date"],
+                "version": seg["version"],
+                "version_basis": seg["version_basis"],
+                "confirmation_seq": seg.get("confirmation_seq"),
+                "delay_minutes": seg.get("delay_minutes"),
+                "cohort_persons": seg["cohort_persons"],
+                "segments": [],
+                "model_available": False,
+            },
+        )
+        prog["segments"].append(
+            {
+                "segment_index": seg["segment_index"],
+                "label": seg["label"],
+                "start_utc": seg["start_utc"],
+                "end_utc": seg["end_utc"],
+                "length_minutes": seg["length_minutes"],
+                "by_day_minutes": seg["by_day_minutes"],
+                "crosses_midnight": seg["crosses_midnight"],
+                "lower_share": seg["hard_bounds"]["lower_share"],
+                "upper_share": seg["hard_bounds"]["upper_share"],
+                "point_available": seg["hard_bounds"]["point_available"],
+                "point_share": seg["hard_bounds"]["point_share"],
+                "model_share": seg["model_estimate"].get("share"),
+                "model_sensitivity": seg["model_estimate"].get("sensitivity"),
+                "model_measured": seg["model_estimate"].get("measured", False),
+                "model_basis": seg["model_estimate"].get("basis"),
+                "model_hard_bound_interval": seg["model_estimate"].get("hard_bound_interval"),
+                "basis": seg["basis"],
+            }
+        )
+        if seg["model_estimate"].get("available"):
+            prog["model_available"] = True
+
+    return {
+        "available": True,
+        "status": summary.get("status"),
+        "unit_minutes": summary.get("unit_minutes"),
+        "model": summary.get("model"),
+        "retention_hash": summary.get("retention_hash"),
+        "monotonicity_satisfied": summary.get("monotonicity_satisfied"),
+        "checks": summary.get("checks"),
+        "record_label_totals": label_totals,
+        "excluded_persons": summary.get("excluded_persons"),
+        "programs": list(programs.values()),
+        "interpretation": {
+            "hard_bounds": "lower = definite-only count; upper = definite + possible. Boundary-crossing "
+            "records only widen the interval.",
+            "point": "point_share is present only when no boundary-crossing record touches the segment.",
+            "model": "model_share is an interval-censored estimate (measured=false) with a disclosed "
+            "sensitivity band; never report it as a measured share.",
+            "cross_midnight": "segments are split at the actual local midnight before day totals.",
+            "every_segment_has_a_point": False,
+        },
+    }

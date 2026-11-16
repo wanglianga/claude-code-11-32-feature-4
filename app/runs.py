@@ -24,10 +24,18 @@ from .analytics.estimate import (
     stratified_household_bootstrap,
 )
 from .analytics.raking import RakingConfig, rake
+from .analytics.retention import compute_retention, retention_hash_payload
 from .config import Settings
 from .db import Database
 from .errors import conflict, invalid, not_found
-from .ingest import load_programs, load_recruitment, load_submissions, load_targets
+from .ingest import (
+    load_confirmations,
+    load_programs,
+    load_recruitment,
+    load_segment_batch,
+    load_submissions,
+    load_targets,
+)
 from .jsonutil import canonical_hash, jb, loads
 from .timeutil import UTC, iso
 
@@ -38,6 +46,7 @@ STAGES = [
     "calibrate",
     "bootstrap",
     "estimate",
+    "segment_retention",
     "publish_report",
 ]
 
@@ -67,7 +76,7 @@ def fetch_run(cur, run_id) -> dict[str, Any]:
         SELECT run_id, status, seed, cutoffs, survey_period, config, config_hash,
                input_hash, parent_run_id, note, created_by, created_at, updated_at,
                started_at, finished_at, failure, calibration, bootstrap, interval_status,
-               published_at
+               retention, retention_status, published_at
           FROM runs WHERE run_id = %s
         """,
         (str(run_id),),
@@ -216,8 +225,89 @@ def create_run(db: Database, settings: Settings, body: dict[str, Any], actor: st
             if cur.fetchone() is None:
                 raise not_found("parent_run_not_found", "parent run does not exist")
 
+        # --- segment-level retention inputs (optional) ---------------------
+        segment_batch_seq = inputs.get("segment_batch_seq")
+        confirmation_seqs = sorted({int(s) for s in (inputs.get("confirmation_seqs") or [])})
+        retention_enabled = bool(config["retention"].get("enabled", True))
+        segment_batch = None
+        confirmations: dict[tuple, dict[str, Any]] = {}
+        if segment_batch_seq is not None:
+            segment_batch = load_segment_batch(cur, int(segment_batch_seq))
+            if not retention_enabled:
+                raise invalid(
+                    "retention_disabled_with_segment_batch",
+                    "a segment batch is pinned but config.retention.enabled is false",
+                )
+            declared = {
+                (b["program_key"], b["air_date"], b["station"]) for b in segment_batch["boundaries"]
+            }
+            airing_keys = {(a["program_key"], a["air_date"], a["station"]) for a in programs["airings"]}
+            unmatched = sorted(
+                f"{k[0]}@{k[1].isoformat()}/{k[2]}" for k in declared - airing_keys
+            )
+            if unmatched:
+                raise invalid(
+                    "segment_batch_unmatched_airing",
+                    "segment boundaries refer to airings that are not in the pinned program batch",
+                    {"airings": unmatched},
+                )
+        if confirmation_seqs:
+            if segment_batch_seq is None:
+                raise invalid(
+                    "confirmation_without_segment_batch",
+                    "broadcast confirmations are only meaningful with a pinned segment batch",
+                )
+            confirmations, found_seqs = load_confirmations(cur, confirmation_seqs)
+            missing_seqs = sorted(set(confirmation_seqs) - set(found_seqs))
+            if missing_seqs:
+                raise invalid(
+                    "confirmation_not_found",
+                    "a pinned confirmation serial does not exist",
+                    {"confirmation_seqs": missing_seqs},
+                )
+            airing_keys = {(a["program_key"], a["air_date"], a["station"]) for a in programs["airings"]}
+            orphan = sorted(
+                f"{k[0]}@{k[1].isoformat()}/{k[2]}"
+                for k in confirmations
+                if k not in airing_keys
+            )
+            if orphan:
+                raise invalid(
+                    "confirmation_unmatched_airing",
+                    "a pinned confirmation refers to an airing that is not in the program batch",
+                    {"airings": orphan},
+                )
+
         margins_for_hash = {
             dim: {cat: float(v) for cat, v in cats.items()} for dim, cats in target_margins.items()
+        }
+        retention_hash_inputs = {
+            "segment_batch_seq": segment_batch_seq,
+            "unit_minutes": float(segment_batch["unit_minutes"]) if segment_batch else None,
+            "boundaries": (
+                [
+                    {
+                        "program_key": b["program_key"],
+                        "air_date": b["air_date"].isoformat(),
+                        "station": b["station"],
+                        "segment_index": b["segment_index"],
+                        "start": float(b["start_offset_min"]),
+                        "end": float(b["end_offset_min"]),
+                    }
+                    for b in segment_batch["boundaries"]
+                ]
+                if segment_batch
+                else []
+            ),
+            "confirmations": [
+                {
+                    "seq": c["seq"],
+                    "confirmed_start": iso(c["confirmed_start"]),
+                    "confirmed_end": iso(c["confirmed_end"]),
+                    "basis": c["basis"],
+                }
+                for c in sorted(confirmations.values(), key=lambda c: c["seq"])
+            ],
         }
         input_hash = canonical_hash(
             {
@@ -248,6 +338,7 @@ def create_run(db: Database, settings: Settings, body: dict[str, Any], actor: st
                     for a in programs["airings"]
                 ],
                 "diary_rows": _diary_hash_rows(cur, seq_cutoff),
+                "retention": retention_hash_inputs,
             }
         )
         config_hash = canonical_hash(config)
@@ -301,6 +392,22 @@ def create_run(db: Database, settings: Settings, body: dict[str, Any], actor: st
             cur.execute(
                 "INSERT INTO run_inputs (run_id, kind, seq, payload) VALUES (%s,%s,%s,%s)",
                 (str(run_id), kind, int(payload.get("batch_seq", payload.get("seq_cutoff", 0))), jb(payload)),
+            )
+        if segment_batch_seq is not None:
+            cur.execute(
+                "INSERT INTO run_inputs (run_id, kind, seq, payload) VALUES (%s,'segment',%s,%s)",
+                (
+                    str(run_id),
+                    int(segment_batch_seq),
+                    jb(
+                        {
+                            "batch_seq": int(segment_batch_seq),
+                            "unit_minutes": float(segment_batch["unit_minutes"]),
+                            "segment_count": len(segment_batch["boundaries"]),
+                            "confirmation_seqs": confirmation_seqs,
+                        }
+                    ),
+                ),
             )
         for stage in STAGES:
             cur.execute(
@@ -493,6 +600,7 @@ def _run_stage(db: Database, conn, cur, run_id, stage: str) -> dict[str, Any]:
         "calibrate": _stage_calibrate,
         "bootstrap": _stage_bootstrap,
         "estimate": _stage_estimate,
+        "segment_retention": _stage_segment_retention,
         "publish_report": _stage_publish,
     }
     return handlers[stage](db, conn, cur, run_id)
@@ -1476,6 +1584,263 @@ def _stage_estimate(db, conn, cur, run_id) -> dict[str, Any]:
         "interval_status": None if intervals_emitted else (bootstrap.get("interval_status") or "no_bootstrap"),
         "bootstrap": bootstrap,
     }
+
+
+# ---------------------------------------------------------------------------
+# Segment-level retention
+# ---------------------------------------------------------------------------
+def _retention_scope(cur, run_id) -> dict[str, Any]:
+    """Rebuild the retention computation inputs from the pinned run inputs.
+
+    Returns ``None``-valued fields when no segment batch was pinned, so the
+    same helper serves the execution stage and the replay endpoint.
+    """
+    run = _run_row(cur, run_id)
+    config = _config(run)
+    inputs = _inputs(cur, run_id)
+    if "segment" not in inputs:
+        return {"enabled": False, "config": config, "run": run}
+    tz = _tz(run)
+    segment_batch = load_segment_batch(cur, int(inputs["segment"]["batch_seq"]))
+    confirmation_seqs = list(inputs["segment"].get("confirmation_seqs") or [])
+    confirmations, _ = load_confirmations(cur, confirmation_seqs)
+    programs = load_programs(cur, inputs["program"]["batch_seq"])
+    recruitment = load_recruitment(cur, inputs["recruitment"]["batch_seq"])
+    submissions = load_submissions(cur, int(inputs["diary"]["seq_cutoff"]))
+    person_ids = [r["person_id"] for r in recruitment["rows"]]
+    resolutions = _load_resolutions(cur, person_ids)
+    expected = survey_days(recruitment["survey_period_start"], recruitment["survey_period_end"])
+
+    boundaries: dict[tuple, list[dict[str, Any]]] = {}
+    for b in segment_batch["boundaries"]:
+        boundaries.setdefault((b["program_key"], b["air_date"], b["station"]), []).append(b)
+
+    rows = _eligible_rows(cur, run_id)
+    persons: list[dict[str, Any]] = []
+    for row in rows:
+        subs = submissions.get(row["person_id"], [])
+        analysis = analyze_person(_frame_stub(row), subs, expected, config, resolutions, tz)
+        reconstruction = analysis["reconstruction"]
+        by_station: dict[str, list[dict[str, Any]]] = {}
+        for entry in reconstruction["entries"]:
+            by_station.setdefault(entry["station"], []).append(
+                {
+                    "start": entry["start"],
+                    "end": entry["end"],
+                    "record_id": str(entry.get("entry_id") or entry.get("source_serial") or ""),
+                    "granularity": float(segment_batch["unit_minutes"]),
+                }
+            )
+        persons.append(
+            {
+                "person_id": row["person_id"],
+                "weight": None if row["final_weight"] is None else float(row["final_weight"]),
+                "records_by_station": by_station,
+                "unknown_ranges": analysis["resolved"]["unknown_ranges"],
+                "coverage": reconstruction["coverage"],
+            }
+        )
+
+    return {
+        "enabled": True,
+        "run": run,
+        "config": config,
+        "tz": tz,
+        "segment_batch": segment_batch,
+        "confirmations": confirmations,
+        "airings": programs["airings"],
+        "boundaries": boundaries,
+        "persons": persons,
+        "eligible_rows": rows,
+    }
+
+
+def _retention_exclusions(cur, run_id) -> dict[str, Any]:
+    """Persons excluded before retention, never silently counted as not listening."""
+    cur.execute(
+        """
+        SELECT exclusion_code, COUNT(*) AS c
+          FROM run_persons WHERE run_id=%s AND NOT eligible
+         GROUP BY exclusion_code ORDER BY exclusion_code
+        """,
+        (str(run_id),),
+    )
+    by_code = {(r["exclusion_code"] or "unknown"): int(r["c"]) for r in cur.fetchall()}
+    return {
+        "by_code": by_code,
+        "unassignable_treatment": (
+            "Persons with a missing diary, an incomplete visit or an unresolved cross-station "
+            "conflict are excluded before retention. They are unassignable, never treated as "
+            "confirmed no-listening, and are removed from both the cohort and the denominator."
+        ),
+    }
+
+
+def _compute_retention(scope: dict[str, Any]) -> dict[str, Any]:
+    cfg = scope["config"]["retention"]
+    return compute_retention(
+        scope["airings"],
+        scope["boundaries"],
+        scope["confirmations"],
+        scope["persons"],
+        scope["tz"],
+        unit_minutes=float(scope["segment_batch"]["unit_minutes"]),
+        model=cfg.get("model", "interval_censored"),
+        require_monotone=bool(cfg.get("require_monotone", True)),
+        monotonicity_tolerance=float(cfg.get("monotonicity_tolerance", 0.0)),
+    )
+
+
+def _persist_retention(cur, run_id, result: dict[str, Any]) -> str:
+    retention_hash = canonical_hash(retention_hash_payload(result))
+    cur.execute("DELETE FROM run_segment_retention WHERE run_id=%s", (str(run_id),))
+    cur.execute("DELETE FROM run_segment_records WHERE run_id=%s", (str(run_id),))
+    cur.execute("DELETE FROM run_segment_checks WHERE run_id=%s", (str(run_id),))
+    for airing in result["airings"]:
+        for seg in airing["segments"]:
+            cur.execute(
+                """
+                INSERT INTO run_segment_retention
+                    (run_id, program_key, air_date, station, segment_index, start_utc, end_utc,
+                     lower_value, upper_value, estimate_value, definite_weight, possible_weight, payload)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                """,
+                (
+                    str(run_id),
+                    seg["program_key"],
+                    seg["air_date"],
+                    seg["station"],
+                    seg["segment_index"],
+                    seg["start_utc"],
+                    seg["end_utc"],
+                    seg["hard_bounds"]["lower_share"],
+                    seg["hard_bounds"]["upper_share"],
+                    seg["model_estimate"].get("share"),
+                    seg["hard_bounds"]["lower_weighted"] or 0,
+                    seg["hard_bounds"]["possible_persons"],
+                    jb(seg),
+                ),
+            )
+    for rec in result["records"]:
+        cur.execute(
+            """
+            INSERT INTO run_segment_records
+                (run_id, program_key, air_date, station, person_id, record_id, record_start_utc,
+                 record_end_utc, granularity_minutes, classification, segment_index,
+                 coverage_fraction, reason)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            """,
+            (
+                str(run_id),
+                rec["program_key"],
+                rec["air_date"],
+                rec["station"],
+                rec["person_id"],
+                rec["record_id"],
+                rec["record_start_utc"],
+                rec["record_end_utc"],
+                rec["granularity_minutes"],
+                rec["classification"],
+                rec["segment_index"],
+                rec["coverage_fraction"],
+                rec["reason"],
+            ),
+        )
+    for check in result["checks"]:
+        cur.execute(
+            """
+            INSERT INTO run_segment_checks
+                (run_id, check_name, program_key, air_date, station, status, payload)
+            VALUES (%s,%s,%s,%s,%s,%s,%s)
+            """,
+            (
+                str(run_id),
+                check["check"],
+                check.get("program_key", ""),
+                check.get("air_date"),
+                check.get("station", ""),
+                check["status"],
+                jb(check),
+            ),
+        )
+    return retention_hash
+
+
+def _stage_segment_retention(db, conn, cur, run_id) -> dict[str, Any]:
+    scope = _retention_scope(cur, run_id)
+    if not scope["enabled"]:
+        summary = {
+            "enabled": False,
+            "status": "not_requested",
+            "reason": "no segment batch was pinned for this run",
+            "retention_hash": None,
+        }
+        cur.execute(
+            "UPDATE runs SET retention=%s, retention_status=%s, updated_at=now() WHERE run_id=%s",
+            (jb(summary), summary["status"], str(run_id)),
+        )
+        return summary
+
+    result = _compute_retention(scope)
+    retention_hash = _persist_retention(cur, run_id, result)
+    exclusions = _retention_exclusions(cur, run_id)
+    status = result["status"]
+    summary = {
+        "enabled": True,
+        "status": status,
+        "retention_hash": retention_hash,
+        "unit_minutes": result["unit_minutes"],
+        "model": result["model"],
+        "monotonicity_satisfied": result["monotonicity_satisfied"],
+        "airings": [
+            {
+                "program_key": a["program_key"],
+                "station": a["station"],
+                "air_date": a["air_date"],
+                "version": a["version"],
+                "version_basis": a["version_basis"],
+                "confirmation_seq": a["confirmation_seq"],
+                "delay_minutes": a["delay_minutes"],
+                "cohort_persons": a["cohort_persons"],
+                "segments": len(a["segments"]),
+                "notes": a["notes"],
+            }
+            for a in result["airings"]
+        ],
+        "checks": result["checks"],
+        "excluded_persons": exclusions,
+        "record_labels": {
+            "definite": sum(1 for r in result["records"] if r["classification"] == "definite"),
+            "possible": sum(1 for r in result["records"] if r["classification"] == "possible"),
+            "unassignable": sum(1 for r in result["records"] if r["classification"] == "unassignable"),
+        },
+        "model_disclosure": (
+            "The model estimate is an interval-censored interpolation inside the recording unit. "
+            "It is measured=false and must never be reported as a measurement."
+            if result["model"] != "none"
+            else "No model estimate requested; only model-free hard bounds are published."
+        ),
+    }
+    cur.execute(
+        "UPDATE runs SET retention=%s, retention_status=%s, updated_at=now() WHERE run_id=%s",
+        (jb(summary), status, str(run_id)),
+    )
+    if status == "violated":
+        failure = {
+            "code": "retention_non_monotone",
+            "message": (
+                "the conservative segment retention curve rises within an airing; "
+                "the publisher refuses to publish a non-monotone retention curve"
+            ),
+            "checks": [c for c in result["checks"] if c["status"] == "violated"],
+        }
+        cur.execute(
+            "UPDATE runs SET status='rejected', failure=%s, finished_at=now(), updated_at=now() WHERE run_id=%s",
+            (jb(failure), str(run_id)),
+        )
+        conn.commit()
+        return {**summary, "published": False, "rejection": failure}
+    return {**summary, "published": True}
 
 
 # ---------------------------------------------------------------------------

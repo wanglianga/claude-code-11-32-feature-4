@@ -265,8 +265,146 @@ def main() -> int:
             "new_run_cutoff": new_cutoff,
         })
 
+    # ---- 10. segment-level retention ---------------------------------------
+    _demo_retention(demo, seeded)
+
     print("\nALL STEPS COMPLETED")
     return 0
+
+
+def _demo_retention(demo: Demo, seeded) -> None:
+    """Show hard bounds, the disclosed model, midnight split and the refusal."""
+    from demo import retention_fixtures as rf
+
+    frames = demo.get("/v1/recruitment/batches") or []
+    targets = demo.get("/v1/targets/batches") or []
+    programs = demo.get("/v1/programs/batches") or []
+    seg_list = demo.get("/v1/segments/batches") or []
+    if not seg_list:
+        show("retention", {"skipped": "no segment batch was seeded"})
+        return
+
+    def pick(items, ref):
+        return next((i for i in items if i.get("batch_ref") == ref), None)
+
+    frame = pick(frames, "retention-frame-v1")
+    target = pick(targets, "retention-targets-v1")
+    program = pick(programs, "retention-schedule-v1")
+    segments = pick(seg_list, "segments-v1")
+    rise_program = pick(programs, "retention-schedule-rise")
+    rise_segments = pick(seg_list, "segments-rising-v1")
+    if not all([frame, target, program, segments, rise_program, rise_segments]):
+        show("retention", {"skipped": "retention batches were not seeded; run scripts/seed.py"})
+        return
+
+    cutoff = demo.get("/v1/diary/cutoff")["available_max_submission_seq"]
+    body = {
+        "note": "demo-retention",
+        "inputs": {
+            "recruitment_batch_seq": frame["batch_seq"],
+            "target_batch_seq": target["batch_seq"],
+            "program_batch_seq": program["batch_seq"],
+            "diary_seq_cutoff": cutoff,
+            "segment_batch_seq": segments["batch_seq"],
+            "confirmation_seqs": [],
+        },
+        "config": {},
+    }
+    created = demo.post("/v1/runs", body)
+    if created is None:
+        show("retention", {"skipped": "retention run could not be created"})
+        return
+    run_id = created["run"]["run_id"]
+    demo.post(f"/v1/runs/{run_id}/execute", {"max_steps": 50})
+    retention = demo.get(f"/v1/runs/{run_id}/segment-retention")
+    if retention is None:
+        show("retention", {"skipped": "no retention on run"})
+        return
+    show("segment retention: hard bounds vs disclosed model (seg_show)", [
+        {
+            "program": p["program_key"],
+            "version": p["version"],
+            "segments": [
+                {
+                    "segment": s["segment_index"],
+                    "lower_share": s["hard_bounds"]["lower_share"],
+                    "upper_share": s["hard_bounds"]["upper_share"],
+                    "model_free_point": s["hard_bounds"]["point_share"],
+                    "model_share": s["model_estimate"]["share"],
+                    "model_measured": s["model_estimate"]["measured"],
+                    "sensitivity": s["model_estimate"]["sensitivity"],
+                    "record_rule": s["basis"]["why"],
+                }
+                for s in p["segments"]
+            ],
+        }
+        for p in retention["programs"]
+        if p["program_key"] == "seg_show"
+    ])
+    late = next((p for p in retention["programs"] if p["program_key"] == "seg_late"), None)
+    if late:
+        crossing = next((s for s in late["segments"] if s["crosses_midnight"]), None)
+        show("cross-midnight segment split by the actual day boundary", {
+            "segment_index": crossing["segment_index"] if crossing else None,
+            "by_day_minutes": crossing["by_day_minutes"] if crossing else None,
+        })
+
+    # Delayed broadcast: a confirmation creates a new analysis version.
+    conf = demo.post("/v1/broadcast/confirmations", rf.delayed_confirmation())
+    if conf:
+        delayed_body = {
+            **body,
+            "note": "demo-retention-delayed",
+            "inputs": {**body["inputs"], "confirmation_seqs": [conf["confirmation_seq"]]},
+        }
+        delayed = demo.post("/v1/runs", delayed_body)
+        if delayed:
+            delayed_id = delayed["run"]["run_id"]
+            demo.post(f"/v1/runs/{delayed_id}/execute", {"max_steps": 50})
+            delayed_ret = demo.get(f"/v1/runs/{delayed_id}/segment-retention")
+            delayed_show = None
+            if delayed_ret:
+                delayed_show = next(
+                    (p for p in delayed_ret["programs"] if p["program_key"] == "seg_show"), None
+                )
+            show("delayed broadcast confirmation: new analysis version, not an edit", {
+                "planned_version_hash": retention["summary"]["retention_hash"],
+                "delayed_version": delayed_show["version"] if delayed_show else None,
+                "delayed_version_basis": delayed_show["version_basis"] if delayed_show else None,
+                "delayed_version_hash": delayed_ret["summary"]["retention_hash"] if delayed_ret else None,
+                "hashes_differ": bool(delayed_ret) and delayed_ret["summary"]["retention_hash"]
+                != retention["summary"]["retention_hash"],
+                "original_report_unchanged": demo.get(f"/v1/runs/{run_id}/report")["report_hash"]
+                == demo.get(f"/v1/runs/{run_id}/report")["report_hash"],
+            })
+
+    # Rising conservative curve: publication refused.
+    rise_body = {
+        "note": "demo-retention-nonmonotone",
+        "inputs": {
+            "recruitment_batch_seq": frame["batch_seq"],
+            "target_batch_seq": target["batch_seq"],
+            "program_batch_seq": rise_program["batch_seq"],
+            "diary_seq_cutoff": cutoff,
+            "segment_batch_seq": rise_segments["batch_seq"],
+            "confirmation_seqs": [],
+        },
+        "config": {},
+    }
+    rise = demo.post("/v1/runs", rise_body)
+    if rise:
+        rise_id = rise["run"]["run_id"]
+        demo.post(f"/v1/runs/{rise_id}/execute", {"max_steps": 50})
+        rise_detail = demo.get(f"/v1/runs/{rise_id}")
+        report_resp = demo.client.get(f"/v1/runs/{rise_id}/report")
+        show("rising conservative retention is refused by the publisher", {
+            "run_status": rise_detail["status"],
+            "failure": (rise_detail.get("failure") or {}).get("code"),
+            "report_http_status": report_resp.status_code,
+        })
+
+    replay = demo.get(f"/v1/runs/{run_id}/segment-retention/replay")
+    show("retention replay reproduces the historical curve", replay)
 
 
 if __name__ == "__main__":

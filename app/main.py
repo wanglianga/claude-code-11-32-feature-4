@@ -15,11 +15,13 @@ from .db import Database
 from .errors import ServiceError, conflict, invalid, not_found
 from .jsonutil import loads
 from .models import (
+    BroadcastConfirmationIn,
     DiarySubmissionIn,
     ExecuteIn,
     ProgramBatchIn,
     RecruitmentBatchIn,
     RunCreateIn,
+    SegmentBatchIn,
     TargetBatchIn,
 )
 from .runs import create_run, execute_run, fetch_run
@@ -123,6 +125,21 @@ def create_app(settings: Settings | None = None, db: Database | None = None) -> 
                 "cross_station_overlap": "pending conflict, never resolved by upload order",
                 "cross_program_comparison": "not supported",
             },
+            "segment_retention": {
+                "granularity": "records are labelled definite / possible / unassignable per segment",
+                "effective_version": (
+                    "a pinned broadcast confirmation is the effective version; otherwise the "
+                    "explicitly specified planned schedule is used"
+                ),
+                "hard_bounds": "lower = definite only; upper = definite + possible; both published",
+                "model_free_point": "present only where no record crosses a segment boundary",
+                "model_estimate": (
+                    "interval-censored, measured=false, with a disclosed sensitivity band; "
+                    "never presented as a measurement"
+                ),
+                "cross_midnight": "segments split at the actual local midnight before day totals",
+                "monotonicity": "publication refused when the conservative curve rises within an airing",
+            },
         }
 
     # ---------------- ingestion ----------------
@@ -152,7 +169,7 @@ def create_app(settings: Settings | None = None, db: Database | None = None) -> 
         with db.scoped() as conn:
             cur = conn.cursor()
             cur.execute(
-                "SELECT batch_seq, population_total, dimension_totals, received_at FROM target_batches ORDER BY batch_seq"
+                "SELECT batch_seq, batch_ref, population_total, dimension_totals, received_at FROM target_batches ORDER BY batch_seq"
             )
             return [
                 {**r, "dimension_totals": loads(r["dimension_totals"]), "received_at": iso(r["received_at"])}
@@ -168,7 +185,7 @@ def create_app(settings: Settings | None = None, db: Database | None = None) -> 
         with db.scoped() as conn:
             cur = conn.cursor()
             cur.execute(
-                "SELECT batch_seq, timezone, row_count, received_at FROM program_batches ORDER BY batch_seq"
+                "SELECT batch_seq, batch_ref, timezone, row_count, received_at FROM program_batches ORDER BY batch_seq"
             )
             return [
                 {**r, "received_at": iso(r["received_at"])} for r in cur.fetchall()
@@ -214,6 +231,52 @@ def create_app(settings: Settings | None = None, db: Database | None = None) -> 
             cur = conn.cursor()
             cur.execute("SELECT COALESCE(MAX(submission_seq),0) AS m FROM diary_submissions")
             return {"available_max_submission_seq": cur.fetchone()["m"]}
+
+    # ---------------- segments + confirmations ----------------
+    @app.post("/v1/segments/batches", status_code=201, tags=["ingestion"])
+    def post_segments(body: SegmentBatchIn, actor: str = Depends(analyst)):
+        return ingest.create_segment_batch(db, body.model_dump(mode="json"), actor)
+
+    @app.get("/v1/segments/batches", tags=["ingestion"])
+    def list_segments(actor: str = Depends(analyst)):
+        with db.scoped() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT batch_seq, batch_ref, unit_minutes, row_count, received_at FROM segment_batches ORDER BY batch_seq"
+            )
+            return [
+                {**r, "received_at": iso(r["received_at"])} for r in cur.fetchall()
+            ]
+
+    @app.get("/v1/segments/batches/{batch_seq}", tags=["ingestion"])
+    def get_segments(batch_seq: int, actor: str = Depends(analyst)):
+        with db.scoped() as conn:
+            return jsonable_encoder(ingest.load_segment_batch(conn.cursor(), batch_seq))
+
+    @app.post("/v1/broadcast/confirmations", status_code=201, tags=["ingestion"])
+    def post_confirmation(body: BroadcastConfirmationIn, actor: str = Depends(analyst)):
+        return ingest.create_confirmation(db, body.model_dump(mode="json"), actor)
+
+    @app.get("/v1/broadcast/confirmations", tags=["ingestion"])
+    def list_confirmations(actor: str = Depends(analyst)):
+        with db.scoped() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT confirmation_seq, program_key, air_date, station, confirmed_start_utc,
+                       confirmed_end_utc, basis, note, created_at
+                  FROM broadcast_confirmations ORDER BY confirmation_seq
+                """
+            )
+            return [
+                {
+                    **r,
+                    "confirmed_start_utc": iso(r["confirmed_start_utc"]),
+                    "confirmed_end_utc": iso(r["confirmed_end_utc"]),
+                    "created_at": iso(r["created_at"]),
+                }
+                for r in cur.fetchall()
+            ]
 
     @app.get("/v1/diary/submissions/{submission_seq}", tags=["ingestion"])
     def get_diary(submission_seq: int, actor: str = Depends(analyst)):
@@ -583,6 +646,152 @@ def create_app(settings: Settings | None = None, db: Database | None = None) -> 
             {**r, "exclusion_detail": loads(r["exclusion_detail"])}
             for r in rows
         ]
+
+    @app.get("/v1/runs/{run_id}/segment-retention", tags=["lineage"])
+    def segment_retention(run_id: str, actor: str = Depends(analyst)):
+        """Per-segment hard bounds, model estimate and basis for the pinned run."""
+        with db.scoped() as conn:
+            cur = conn.cursor()
+            run = fetch_run(cur, run_id)
+            if not run.get("retention"):
+                raise not_found(
+                    "retention_not_available",
+                    "no segment retention was computed for this run",
+                )
+            cur.execute(
+                """
+                SELECT payload FROM run_segment_retention WHERE run_id=%s
+                 ORDER BY program_key, air_date, station, segment_index
+                """,
+                (run_id,),
+            )
+            segments = [loads(r["payload"]) for r in cur.fetchall()]
+        programs: dict[str, dict[str, Any]] = {}
+        for seg in segments:
+            prog = programs.setdefault(
+                seg["program_key"],
+                {
+                    "program_key": seg["program_key"],
+                    "title": seg["title"],
+                    "station": seg["station"],
+                    "air_date": seg["air_date"],
+                    "version": seg["version"],
+                    "version_basis": seg["version_basis"],
+                    "confirmation_seq": seg.get("confirmation_seq"),
+                    "delay_minutes": seg.get("delay_minutes"),
+                    "cohort_persons": seg["cohort_persons"],
+                    "segments": [],
+                },
+            )
+            prog["segments"].append(seg)
+        return {
+            "run_id": run_id,
+            "summary": run["retention"],
+            "status": run.get("retention_status"),
+            "programs": list(programs.values()),
+            "model_disclosure": {
+                "hard_bounds": "definite-only lower bound; definite+possible upper bound",
+                "model_estimate_measured": False,
+                "point_requires_no_boundary_crossing": True,
+            },
+        }
+
+    @app.get("/v1/runs/{run_id}/segment-retention/records", tags=["lineage"])
+    def segment_records(
+        run_id: str,
+        actor: str = Depends(analyst),
+        program_key: str | None = None,
+        classification: str | None = None,
+        person_id: str | None = None,
+        limit: int = Query(default=500, le=5000),
+        offset: int = Query(default=0, ge=0),
+    ):
+        clauses = ["run_id=%s"]
+        params: list[Any] = [run_id]
+        if program_key:
+            clauses.append("program_key=%s")
+            params.append(program_key)
+        if classification:
+            clauses.append("classification=%s")
+            params.append(classification)
+        if person_id:
+            clauses.append("person_id=%s")
+            params.append(person_id)
+        params.extend([limit, offset])
+        with db.scoped() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                f"""
+                SELECT program_key, air_date, station, person_id, record_id, record_start_utc,
+                       record_end_utc, granularity_minutes, classification, segment_index,
+                       coverage_fraction, reason
+                  FROM run_segment_records WHERE {' AND '.join(clauses)}
+                 ORDER BY program_key, air_date, station, person_id, record_start_utc
+                 LIMIT %s OFFSET %s
+                """,
+                params,
+            )
+            rows = cur.fetchall()
+        return [
+            {
+                **r,
+                "air_date": r["air_date"].isoformat(),
+                "record_start_utc": iso(r["record_start_utc"]),
+                "record_end_utc": iso(r["record_end_utc"]),
+            }
+            for r in rows
+        ]
+
+    @app.get("/v1/runs/{run_id}/segment-retention/checks", tags=["lineage"])
+    def segment_checks(run_id: str, actor: str = Depends(analyst)):
+        with db.scoped() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT check_name, status, payload FROM run_segment_checks WHERE run_id=%s ORDER BY check_name, payload->>'program_key'",
+                (run_id,),
+            )
+            checks = [
+                {"check": r["check_name"], "status": r["status"], **loads(r["payload"])}
+                for r in cur.fetchall()
+            ]
+        return {
+            "run_id": run_id,
+            "monotonicity_satisfied": all(
+                c["status"] != "violated" for c in checks if c["check"] == "retention_monotonicity"
+            ),
+            "checks": checks,
+        }
+
+    @app.get("/v1/runs/{run_id}/segment-retention/replay", tags=["lineage"])
+    def segment_replay(run_id: str, actor: str = Depends(analyst)):
+        """Recompute retention from the pinned inputs and compare hashes.
+
+        A matched hash proves the historical curve can be reproduced from the
+        same inputs, seed and version; a mismatch flags non-determinism.
+        """
+        from .jsonutil import canonical_hash
+        from .runs import _compute_retention, _retention_scope
+        from .analytics.retention import retention_hash_payload
+
+        with db.scoped() as conn:
+            cur = conn.cursor()
+            run = fetch_run(cur, run_id)
+            recorded = (run.get("retention") or {}).get("retention_hash")
+            scope = _retention_scope(cur, run_id)
+            if not scope["enabled"]:
+                raise not_found("retention_not_available", "no segment retention was computed for this run")
+            result = _compute_retention(scope)
+            replay_hash = canonical_hash(retention_hash_payload(result))
+        return {
+            "run_id": run_id,
+            "recorded_retention_hash": recorded,
+            "replay_retention_hash": replay_hash,
+            "reproduced": recorded == replay_hash,
+            "pinned_inputs": {
+                "segment_batch_seq": scope["segment_batch"]["batch_seq"],
+                "confirmation_count": len(scope["confirmations"]),
+            },
+        }
 
     return app
 

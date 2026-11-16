@@ -167,12 +167,90 @@ class ThresholdsIn(Strict):
     min_effective_sample_share: float = Field(default=0.25, ge=0, le=1)
 
 
+class RetentionIn(Strict):
+    """Segment-level retention configuration.
+
+    ``model`` controls the optional interval-censored estimate. It is *never*
+    presented as a measurement; ``none`` publishes hard bounds only.
+    """
+
+    enabled: bool = Field(
+        default=True,
+        description="Compute segment retention when a segment batch is pinned.",
+    )
+    model: Literal["interval_censored", "none"] = Field(
+        default="interval_censored",
+        description=(
+            "interval_censored: declare a within-granularity endpoint distribution and publish a "
+            "model estimate with its sensitivity band. none: hard bounds only, no model estimate."
+        ),
+    )
+    require_monotone: bool = Field(
+        default=True,
+        description="Refuse publication when the conservative retention curve rises within an airing.",
+    )
+    monotonicity_tolerance: float = Field(default=0.0, ge=0)
+
+
+class SegmentSpecIn(Strict):
+    start_offset_min: Decimal = Field(ge=0, description="Minutes from the effective airing start.")
+    end_offset_min: Decimal = Field(gt=0, description="Minutes from the effective airing start.")
+    label: str | None = None
+
+    @model_validator(mode="after")
+    def _order(self):
+        if self.end_offset_min <= self.start_offset_min:
+            raise ValueError("segment end_offset_min must exceed start_offset_min")
+        return self
+
+
+class SegmentAiringIn(Strict):
+    program_key: str = Field(min_length=1)
+    air_date: date
+    station: str = Field(min_length=1)
+    segments: list[SegmentSpecIn] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _contiguous_and_ordered(self):
+        ordered = sorted(self.segments, key=lambda s: s.start_offset_min)
+        prev = Decimal(0)
+        for idx, seg in enumerate(ordered):
+            if seg.start_offset_min != prev:
+                raise ValueError(
+                    f"segments must be contiguous from 0; segment #{idx} starts at "
+                    f"{seg.start_offset_min} but {prev} was expected"
+                )
+            prev = seg.end_offset_min
+        return self
+
+
+class SegmentBatchIn(Strict):
+    batch_ref: str | None = None
+    unit_minutes: float = Field(
+        gt=0,
+        description="Recording granularity in minutes (e.g. 5). A record's endpoints are known only to this unit.",
+    )
+    granularity_note: str | None = None
+    airings: list[SegmentAiringIn] = Field(min_length=1)
+
+
+class BroadcastConfirmationIn(Strict):
+    program_key: str = Field(min_length=1)
+    air_date: date
+    station: str = Field(min_length=1)
+    confirmed_start: str = Field(description="Confirmed as-aired start instant (ISO 8601 with offset).")
+    confirmed_end: str = Field(description="Confirmed as-aired end instant (ISO 8601 with offset).")
+    basis: Literal["as_aired_log", "encoder_log", "analyst_confirmed"] = "analyst_confirmed"
+    note: str | None = None
+
+
 class RunConfigIn(Strict):
     timezone: str | None = Field(default=None, description="Study timezone; must match the program batch timezone.")
     completeness: CompletenessIn = Field(default_factory=CompletenessIn)
     raking: RakingIn = Field(default_factory=RakingIn)
     bootstrap: BootstrapIn = Field(default_factory=BootstrapIn)
     thresholds: ThresholdsIn = Field(default_factory=ThresholdsIn)
+    retention: RetentionIn = Field(default_factory=RetentionIn)
     allow_program_comparison: bool = Field(
         default=False,
         description="Leave false: coverage gaps make cross-program performance comparison invalid.",
@@ -184,6 +262,13 @@ class RunInputsIn(Strict):
     target_batch_seq: int = Field(ge=1)
     program_batch_seq: int = Field(ge=1)
     diary_seq_cutoff: int = Field(ge=0, description="Pinned diary submission serial; 0 means no diary rows.")
+    segment_batch_seq: int | None = Field(
+        default=None, ge=1, description="Pinned segment-boundary batch; omit to skip retention."
+    )
+    confirmation_seqs: list[int] = Field(
+        default_factory=list,
+        description="Pinned broadcast-confirmation serials used as the effective version for their airings.",
+    )
 
 
 class RunCreateIn(Strict):

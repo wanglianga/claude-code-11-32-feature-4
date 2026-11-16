@@ -489,3 +489,222 @@ def load_submissions(cur, seq_cutoff: int) -> dict[str, list[dict[str, Any]]]:
             }
         )
     return by_person
+
+
+# ---------------------------------------------------------------------------
+# Segment boundaries (segment-level retention)
+# ---------------------------------------------------------------------------
+def create_segment_batch(db: Database, payload: dict[str, Any], actor: str) -> dict[str, Any]:
+    """Store a declared segment-boundary batch for one or more airings.
+
+    Boundaries are expressed as minute offsets from each airing's *effective*
+    start, so the same offsets apply to the planned schedule and to a confirmed
+    (delayed) version. A run pins the batch sequence plus the confirmation
+    serials it treated as authoritative.
+    """
+    unit = float(payload["unit_minutes"])
+    if unit <= 0:
+        raise invalid("segment_unit_invalid", "unit_minutes must be positive")
+    rows: list[dict[str, Any]] = []
+    for idx, airing in enumerate(payload["airings"]):
+        specs = sorted(airing["segments"], key=lambda s: float(s["start_offset_min"]))
+        expected = 0.0
+        for seg_no, spec in enumerate(specs):
+            start = float(spec["start_offset_min"])
+            end = float(spec["end_offset_min"])
+            if end <= start:
+                raise invalid(
+                    "segment_boundary_invalid",
+                    "segment end_offset_min must exceed start_offset_min",
+                    {"airing": idx, "segment": seg_no},
+                )
+            if abs(start - expected) > 1e-9:
+                raise invalid(
+                    "segment_boundary_gap",
+                    "segments must be contiguous from offset 0",
+                    {"airing": idx, "segment": seg_no, "expected_start": expected, "start": start},
+                )
+            expected = end
+            rows.append(
+                {
+                    "program_key": airing["program_key"],
+                    "air_date": airing["air_date"],
+                    "station": airing["station"],
+                    "segment_index": seg_no,
+                    "start_offset_min": start,
+                    "end_offset_min": end,
+                    "label": spec.get("label"),
+                }
+            )
+    with db.scoped() as conn:
+        cur = conn.cursor()
+        existing = _next_batch_seq_from_ref(cur, "segment_batches", payload.get("batch_ref"))
+        if existing is not None:
+            return {"batch_seq": existing, "idempotent": True}
+        cur.execute(
+            """
+            INSERT INTO segment_batches (batch_ref, actor, unit_minutes, granularity_note, row_count)
+            VALUES (%s,%s,%s,%s,%s) RETURNING batch_seq
+            """,
+            (payload.get("batch_ref"), actor, unit, payload.get("granularity_note"), len(rows)),
+        )
+        batch_seq = cur.fetchone()["batch_seq"]
+        for row in rows:
+            cur.execute(
+                """
+                INSERT INTO segment_boundaries
+                    (batch_seq, program_key, air_date, station, version, segment_index,
+                     start_offset_min, end_offset_min, label)
+                VALUES (%s,%s,%s,%s,'planned',%s,%s,%s,%s)
+                """,
+                (
+                    batch_seq,
+                    row["program_key"],
+                    row["air_date"],
+                    row["station"],
+                    row["segment_index"],
+                    row["start_offset_min"],
+                    row["end_offset_min"],
+                    row["label"],
+                ),
+            )
+        _audit(
+            cur,
+            actor,
+            "segment.batch.create",
+            "segment_batch",
+            str(batch_seq),
+            {"rows": len(rows), "airings": len(payload["airings"]), "unit_minutes": unit},
+        )
+        conn.commit()
+    return {
+        "batch_seq": batch_seq,
+        "airing_count": len(payload["airings"]),
+        "segment_count": len(rows),
+        "unit_minutes": unit,
+        "idempotent": False,
+    }
+
+
+def load_segment_batch(cur, batch_seq: int) -> dict[str, Any]:
+    cur.execute("SELECT * FROM segment_batches WHERE batch_seq = %s", (batch_seq,))
+    batch = cur.fetchone()
+    if batch is None:
+        raise not_found("segment_batch_not_found", f"segment batch {batch_seq} not found")
+    cur.execute(
+        "SELECT * FROM segment_boundaries WHERE batch_seq = %s ORDER BY air_date, program_key, station, segment_index",
+        (batch_seq,),
+    )
+    return {**batch, "boundaries": cur.fetchall()}
+
+
+# ---------------------------------------------------------------------------
+# Broadcast confirmations (as-aired versions)
+# ---------------------------------------------------------------------------
+def create_confirmation(db: Database, payload: dict[str, Any], actor: str) -> dict[str, Any]:
+    """Register the confirmed as-aired version of one airing (append-only).
+
+    The start/end instants are stored as UTC. If the confirmation differs from
+    the planned slot, every analysis that pins this serial uses the confirmed
+    version, producing a *new* analysis version rather than silently editing an
+    existing published report.
+    """
+    start = parse_aware(payload["confirmed_start"], "confirmed_start")
+    end = parse_aware(payload["confirmed_end"], "confirmed_end")
+    if end <= start:
+        raise invalid("confirmation_order", "confirmed_end must be after confirmed_start")
+    basis = payload.get("basis") or "analyst_confirmed"
+    if basis not in ("as_aired_log", "encoder_log", "analyst_confirmed"):
+        raise invalid("confirmation_basis_invalid", "unknown confirmation basis", {"basis": basis})
+    with db.scoped() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO broadcast_confirmations
+                (program_key, air_date, station, confirmed_start_utc, confirmed_end_utc,
+                 basis, note, actor)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (program_key, air_date, station, confirmed_start_utc, confirmed_end_utc)
+            DO NOTHING
+            RETURNING confirmation_seq
+            """,
+            (
+                payload["program_key"],
+                payload["air_date"],
+                payload["station"],
+                start,
+                end,
+                basis,
+                payload.get("note"),
+                actor,
+            ),
+        )
+        row = cur.fetchone()
+        if row is None:
+            cur.execute(
+                """
+                SELECT confirmation_seq FROM broadcast_confirmations
+                 WHERE program_key=%s AND air_date=%s AND station=%s
+                   AND confirmed_start_utc=%s AND confirmed_end_utc=%s
+                """,
+                (payload["program_key"], payload["air_date"], payload["station"], start, end),
+            )
+            confirmation_seq = cur.fetchone()["confirmation_seq"]
+            idempotent = True
+        else:
+            confirmation_seq = row["confirmation_seq"]
+            idempotent = False
+            _audit(
+                cur,
+                actor,
+                "confirmation.create",
+                "broadcast_confirmation",
+                str(confirmation_seq),
+                {"program_key": payload["program_key"], "start": start.isoformat(), "end": end.isoformat()},
+            )
+        conn.commit()
+    return {
+        "confirmation_seq": confirmation_seq,
+        "program_key": payload["program_key"],
+        "air_date": payload["air_date"],
+        "station": payload["station"],
+        "confirmed_start": start.isoformat().replace("+00:00", "Z"),
+        "confirmed_end": end.isoformat().replace("+00:00", "Z"),
+        "basis": basis,
+        "idempotent": idempotent,
+        "affects": "new runs only",
+    }
+
+
+def load_confirmations(
+    cur, seqs: list[int]
+) -> tuple[dict[tuple[str, Any, str], dict[str, Any]], list[int]]:
+    """Load the pinned confirmations, keyed by (program_key, air_date, station).
+
+    If two pinned serials target the same airing the later serial wins; callers
+    that care should not pin conflicting versions for one airing. Returns the
+    keyed version map plus the list of serials actually found.
+    """
+    if not seqs:
+        return {}, []
+    cur.execute(
+        """
+        SELECT confirmation_seq, program_key, air_date, station, confirmed_start_utc,
+               confirmed_end_utc, basis, note
+          FROM broadcast_confirmations
+         WHERE confirmation_seq = ANY(%s)
+         ORDER BY confirmation_seq
+        """,
+        (list(seqs),),
+    )
+    rows = cur.fetchall()
+    out: dict[tuple[str, Any, str], dict[str, Any]] = {}
+    for r in rows:
+        out[(r["program_key"], r["air_date"], r["station"])] = {
+            "seq": r["confirmation_seq"],
+            "confirmed_start": r["confirmed_start_utc"],
+            "confirmed_end": r["confirmed_end_utc"],
+            "basis": r["basis"],
+            "note": r["note"],
+        }
+    return out, [r["confirmation_seq"] for r in rows]

@@ -375,3 +375,125 @@ DROP TRIGGER IF EXISTS run_reports_no_update ON run_reports;
 CREATE TRIGGER run_reports_no_update
     BEFORE UPDATE OR DELETE ON run_reports
     FOR EACH ROW EXECUTE FUNCTION forbid_report_mutation();
+
+-- ---------------------------------------------------------------------------
+-- Segment-level retention for coarse (e.g. 5-minute) listening records.
+--
+-- A program is cut into *segments* by a declared segment batch. A segment is
+-- a half-open [start_offset, end_offset) measured in minutes from the program
+-- airing's planned start. Planned boundaries come from the schedule batch; a
+-- confirmed (as-aired) version can shift them (delayed broadcast).
+--
+-- A record that crosses a segment boundary cannot say which side the listener
+-- stopped on. Records are therefore classified, per segment, into:
+--   definite   fully inside one segment of one confirmed airing
+--   possible   overlaps the segment (or its boundary) but is ambiguous
+--   unassignable  cannot be tied to any confirmed version
+-- Only *definite* records form the model-free count. *Possible* records widen
+-- the interval but are never converted into a point share.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS segment_batches (
+    batch_seq    BIGSERIAL PRIMARY KEY,
+    batch_ref    TEXT UNIQUE,
+    received_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    actor        TEXT NOT NULL,
+    unit_minutes NUMERIC(10,4) NOT NULL,
+    granularity_note TEXT,
+    row_count    INTEGER NOT NULL,
+    CONSTRAINT segment_unit_positive CHECK (unit_minutes > 0)
+);
+
+-- Boundary segments for one confirmed airing. ``version`` is 'planned' or a
+-- confirmation id; boundaries are stored as minute offsets from planned start.
+CREATE TABLE IF NOT EXISTS segment_boundaries (
+    boundary_id  BIGSERIAL PRIMARY KEY,
+    batch_seq    BIGINT NOT NULL REFERENCES segment_batches(batch_seq),
+    program_key  TEXT NOT NULL,
+    air_date     DATE NOT NULL,
+    station      TEXT NOT NULL,
+    version      TEXT NOT NULL DEFAULT 'planned',
+    segment_index INTEGER NOT NULL,
+    start_offset_min NUMERIC(12,4) NOT NULL,
+    end_offset_min   NUMERIC(12,4) NOT NULL,
+    label        TEXT,
+    CONSTRAINT segment_boundary_order CHECK (end_offset_min > start_offset_min),
+    UNIQUE (batch_seq, program_key, air_date, station, version, segment_index)
+);
+
+CREATE INDEX IF NOT EXISTS segment_boundaries_lookup_idx
+    ON segment_boundaries (batch_seq, program_key, air_date);
+
+-- Broadcast confirmations: the *authoritative* version for an airing. Append
+-- only; a run pins the confirmation serials it used. A confirmation that
+-- shifts a delayed broadcast invalidates the planned boundaries, and a new
+-- analysis version is produced (never a silent in-place edit).
+CREATE TABLE IF NOT EXISTS broadcast_confirmations (
+    confirmation_seq BIGSERIAL PRIMARY KEY,
+    program_key      TEXT NOT NULL,
+    air_date         DATE NOT NULL,
+    station          TEXT NOT NULL,
+    confirmed_start_utc TIMESTAMPTZ NOT NULL,
+    confirmed_end_utc   TIMESTAMPTZ NOT NULL,
+    basis            TEXT NOT NULL,
+    note             TEXT,
+    actor            TEXT NOT NULL,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT confirmation_order CHECK (confirmed_end_utc > confirmed_start_utc),
+    CONSTRAINT confirmation_basis_enum CHECK (basis IN ('as_aired_log','encoder_log','analyst_confirmed')),
+    UNIQUE (program_key, air_date, station, confirmed_start_utc, confirmed_end_utc)
+);
+
+CREATE TABLE IF NOT EXISTS run_segment_retention (
+    run_id       UUID NOT NULL REFERENCES runs(run_id),
+    program_key  TEXT NOT NULL,
+    air_date     DATE NOT NULL,
+    station      TEXT NOT NULL,
+    segment_index INTEGER NOT NULL,
+    start_utc    TIMESTAMPTZ NOT NULL,
+    end_utc      TIMESTAMPTZ NOT NULL,
+    lower_value  NUMERIC(20,6),
+    upper_value  NUMERIC(20,6),
+    estimate_value NUMERIC(20,6),
+    definite_weight NUMERIC(20,6) NOT NULL DEFAULT 0,
+    possible_weight NUMERIC(20,6) NOT NULL DEFAULT 0,
+    payload      JSONB NOT NULL,
+    PRIMARY KEY (run_id, program_key, air_date, station, segment_index)
+);
+
+CREATE TABLE IF NOT EXISTS run_segment_records (
+    run_id        UUID NOT NULL REFERENCES runs(run_id),
+    program_key   TEXT NOT NULL,
+    air_date      DATE NOT NULL,
+    station       TEXT NOT NULL,
+    person_id     TEXT NOT NULL,
+    record_id     TEXT,
+    record_start_utc TIMESTAMPTZ NOT NULL,
+    record_end_utc   TIMESTAMPTZ NOT NULL,
+    granularity_minutes NUMERIC(10,4),
+    classification TEXT NOT NULL,
+    segment_index INTEGER,
+    coverage_fraction NUMERIC(10,6),
+    reason        TEXT NOT NULL,
+    CONSTRAINT segment_record_class_enum CHECK (
+        classification IN ('definite','possible','unassignable')
+    )
+);
+
+CREATE INDEX IF NOT EXISTS run_segment_records_run_idx
+    ON run_segment_records (run_id, program_key, air_date, station);
+
+CREATE TABLE IF NOT EXISTS run_segment_checks (
+    run_id      UUID NOT NULL REFERENCES runs(run_id),
+    check_name  TEXT NOT NULL,
+    program_key TEXT NOT NULL,
+    air_date    DATE NOT NULL,
+    station     TEXT NOT NULL,
+    status      TEXT NOT NULL,
+    payload     JSONB NOT NULL,
+    PRIMARY KEY (run_id, check_name, program_key, air_date, station)
+);
+
+-- Retention state on the run row. Added idempotently so an existing schema
+-- upgrades in place without a destructive migration.
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS retention JSONB;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS retention_status TEXT;
